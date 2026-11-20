@@ -56,7 +56,7 @@ GAMMA_MAX = 1.3         # x ** gamma with gamma in [1/1.3, 1.3] (softer / sharpe
 # STAGE1_EPOCHS epochs; at the end of the last of them it fits the whitening,
 # then (STAGE2 = "vae") trains the stage-2 VAE in the following epochs, with
 # stage 1 frozen. NUM_EPOCHS of code/myoptim.py adds the two.
-STAGE2 = None           # None (stage 1 only, no quotes), "whiten", or "vae" (whiten + stage-2 VAE)
+STAGE2 = "whiten"           # None (stage 1 only, no quotes), "whiten", or "vae" (whiten + stage-2 VAE)
                         # "vae" collapses for now (gamma stays 1, KL 0): FID 120+, recon 80+
 STAGE1_EPOCHS = 268
 STAGE2_EPOCHS = 300     # epochs of the stage-2 VAE (used only with STAGE2 = "vae")
@@ -65,6 +65,17 @@ STAGE2_INPUT = "sample" # latents for stage 2: "sample" z ~ q(z|x) or "mean" mu 
 STAGE2_STAT_PASSES = 20 # passes over the training images to fit the whitening
 STAGE2_REPEAT = 8       # each image is encoded this many times per stage-2 step
 STAGE2_LOG_GAMMA_MIN = -12.0  # lower bound of log gamma of the stage-2 decoder
+
+# EMA of the weights: an exponential moving average of the stage-1 weights is
+# kept beside them, updated after every optimizer step with the decay
+# min(EMA_DECAY, (1 + n) / (10 + n)) at step n (warm-up, so that the random
+# initial weights are forgotten quickly). At the end of the last stage-1 epoch
+# it replaces the weights, before the whitening is fitted, so the notebook
+# saves, samples and evaluates the EMA weights. 0.995 averages about the last
+# 200 steps (25 epochs of 8 batches). The learning rate is left as set by
+# myoptim.get_optimizer.
+EMA = True
+EMA_DECAY = 0.995
 
 # Denoising: probability that an image is corrupted, then one of three
 # corruptions chosen uniformly
@@ -254,7 +265,7 @@ def loss_function(x, x_hat, mu, logvar):
     return loss, recon, kl
 
 
-def train_one_epoch(model, optimizer, dataloader, device):
+def train_one_epoch(model, optimizer, dataloader, device, kl_weight=1.0):
     """Train `model` for one epoch, i.e. one pass over `dataloader`.
 
     For every mini-batch: move the images to `device`, run the model,
@@ -267,6 +278,9 @@ def train_one_epoch(model, optimizer, dataloader, device):
         dataloader: yields batches of images, shape (B, 1, 32, 32), values
                     in [0, 1] (there are no labels).
         device:     torch.device to compute on.
+        kl_weight:  weight of the KL term in the loss that is back-propagated
+                    (KL warm-up of compare_configs.py; the returned loss is
+                    always recon + kl).
 
     Returns:
         dict {"loss": ..., "recon": ..., "kl": ...} of Python floats: the
@@ -277,11 +291,12 @@ def train_one_epoch(model, optimizer, dataloader, device):
         raise ValueError(f'mytrain.STAGE2 = {STAGE2!r}: use None (no quotes), "whiten" or "vae"')
     model.train()
     model.epochs_trained = getattr(model, "epochs_trained", 0) + 1
+    stage1 = int(model.stage2_mode) != MODE_VAE
     acc_loss = acc_recon = acc_kl = 0
 
     for x in dataloader:
         b = x.size(0)
-        if int(model.stage2_mode) == MODE_VAE:
+        if not stage1:
             loss, recon, kl = _stage2_step(model, optimizer, x, device)
         else:
             # augmentation on the CPU batch: cheap at 32 x 32, and the same on every device
@@ -291,20 +306,83 @@ def train_one_epoch(model, optimizer, dataloader, device):
             x_hat = model.decode1(model.reparameterize(mu, logvar))
             loss, recon, kl = loss_function(x, x_hat, mu, logvar)
             optimizer.zero_grad()
-            loss.backward()
+            (loss if kl_weight == 1.0 else recon + kl_weight * kl).backward()
             optimizer.step()
+            ema_update(model)
         acc_loss += loss.item() * b
         acc_recon += recon.item() * b
         acc_kl += kl.item() * b
 
-    # end of stage 1: switch to stage 2
-    if (STAGE2 and model.epochs_trained == STAGE1_EPOCHS
-            and int(model.stage2_mode) == MODE_STAGE1):
-        start_stage2(model, dataloader, device, STAGE2)
+    # end of stage 1: EMA weights into the model, then switch to stage 2
+    if model.epochs_trained == STAGE1_EPOCHS and stage1:
+        ema_apply(model)
+        if STAGE2 and int(model.stage2_mode) == MODE_STAGE1:
+            start_stage2(model, dataloader, device, STAGE2)
 
     n = len(dataloader.dataset)
     losses = {"loss": acc_loss / n, "recon": acc_recon / n, "kl": acc_kl / n}
     return losses
+
+
+# ------------------------------------------------------------------ EMA of the weights
+
+def _stage1_params(model):
+    return [(n, p) for n, p in model.named_parameters() if not n.startswith("s2.")]
+
+
+@torch.no_grad()
+def ema_update(model):
+    """After an optimizer step of stage 1 (EMA): update the EMA of the
+    stage-1 weights, kept in model.ema (not in the state_dict)."""
+    if not EMA or getattr(model, "ema_applied", False):
+        return
+    if getattr(model, "ema", None) is None:
+        model.ema, model.ema_steps = {n: p.detach().clone() for n, p in _stage1_params(model)}, 0
+    model.ema_steps += 1
+    beta = min(EMA_DECAY, (1 + model.ema_steps) / (10 + model.ema_steps))
+    for n, p in _stage1_params(model):
+        model.ema[n].mul_(beta).add_(p.detach(), alpha=1 - beta)
+
+
+@torch.no_grad()
+def _swap_ema(model):
+    for n, p in _stage1_params(model):
+        tmp = p.detach().clone()
+        p.copy_(model.ema[n])
+        model.ema[n].copy_(tmp)
+
+
+def ema_apply(model):
+    """Put the EMA weights into the model for good (end of stage 1)."""
+    if getattr(model, "ema", None) is not None and not getattr(model, "ema_applied", False):
+        _swap_ema(model)
+    ema_discard(model)
+
+
+def ema_discard(model):
+    """Forget the EMA: the weights of the model are final (also after loading
+    weights that already are EMA weights, as compare_configs.py does)."""
+    model.ema, model.ema_applied = None, True
+
+
+class ema_weights:
+    """Context manager: the model has its EMA weights inside the block, its
+    training weights again after it (to measure during the training). Does
+    nothing without an EMA."""
+
+    def __init__(self, model):
+        self.model = model
+        self.active = getattr(model, "ema", None) is not None
+
+    def __enter__(self):
+        if self.active:
+            _swap_ema(self.model)
+        return self.model
+
+    def __exit__(self, *exc):
+        if self.active:
+            _swap_ema(self.model)
+        return False
 
 
 # ------------------------------------------------------------------ stage 2
@@ -324,12 +402,23 @@ def _stage1_latents(model, x):
 def start_stage2(model, dataloader, device, kind="vae"):
     """Fit the whitening to the stage-1 latents of the training images
     (STAGE2_STAT_PASSES passes, with fresh augmentation and z samples each
-    time) and switch the model to stage 2: kind "whiten" or "vae"."""
+    time) and switch the model to stage 2: kind "whiten" or "vae".
+
+    All its random numbers (shuffling, augmentation, z samples) come from the
+    CPU generator, so a caller can keep its training unchanged by wrapping it
+    in torch.random.fork_rng(devices=[])."""
     if kind not in ("whiten", "vae"):
         raise ValueError(f'start_stage2: kind = {kind!r}, expected "whiten" or "vae"')
     model.eval()
-    z = torch.cat([_stage1_latents(model, _stage2_images(x).to(device)).cpu()
-                   for _ in range(STAGE2_STAT_PASSES) for x in dataloader]).double()
+    zs = []
+    for _ in range(STAGE2_STAT_PASSES):
+        for x in dataloader:
+            mu, logvar = model.encode1(_stage2_images(x).to(device))
+            mu, logvar = mu.cpu(), logvar.cpu()
+            if STAGE2_INPUT == "sample":
+                mu = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar)
+            zs.append(mu)
+    z = torch.cat(zs).double()
     mean = z.mean(0)
     cov = torch.cov(z.T)
     model.set_whitening(mean, cov, MODE_VAE if kind == "vae" else MODE_WHITEN)

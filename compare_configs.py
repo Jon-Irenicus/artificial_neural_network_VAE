@@ -15,9 +15,13 @@ When it is measured:
 
 KL warm-up (KL annealing): the weight of the KL term in the loss that is
 back-propagated grows linearly from 0 at epoch 1 to 1 at epoch `warmup + 1`,
-and stays 1 afterwards. `warmup 0` is the plain loss recon + kl, trained with
-`train_one_epoch` of code/mytrain.py unchanged. The warm-up is implemented
-only in this script: code/mytrain.py is not modified.
+and stays 1 afterwards. `warmup 0` is the plain loss recon + kl. Both are
+trained with `train_one_epoch` of code/mytrain.py (the warm-up through its
+argument kl_weight, which the notebook does not use).
+
+EMA of the weights (--ema, default EMA of code/mytrain.py): the model is
+measured with its EMA weights (periodic measures, validation loss, best
+epoch of the early stop); after the last epoch they replace the weights.
 
 Data:
   default   no test image is used, as the README asks for the training.
@@ -44,9 +48,21 @@ Device (--device, default auto):
             accepted as an alias: ROCm builds use the device name cuda).
   dml       DirectML (pip install torch-directml).
   mps, cpu
-The Inception-v3 features of the FID are computed on the device; their
-statistics and the Frechet distance are computed on the CPU (DirectML has no
-eigenvalue routine) with the float32 formulas of torcheval.
+The Inception-v3 network of the FID runs on the device. The images are
+enlarged to 299 x 299 before it on the CPU (the bilinear interpolation of
+DirectML gives different values), and the statistics of the features and the
+Frechet distance are computed on the CPU (DirectML has no eigenvalue routine)
+with the float32 formulas of torcheval.
+
+Whitening (--whiten, default both): the second stage of code/mymodel.py, which
+decodes z = m + L u with u ~ N(0, I), m and L L^T the mean and covariance of
+the latents of the training images (mytrain.start_stage2). At every
+measurement the model is measured as trained ("none") and with the whitening
+fitted to its training images ("whiten"), then switched back, so that its
+training goes on unchanged (the random numbers of the fit are not taken from
+those of the training). The reconstruction error is the same for both: the
+whitening is exactly invertible. Whatever STAGE2 of code/mytrain.py says, the
+model is never switched during the training.
 
 Seeds (--seeds, default 0): every setting is trained once per seed, and the
 values are averaged over the seeds (mean +- standard deviation), so that a
@@ -65,6 +81,8 @@ Examples:
     python compare_configs.py --early-stop --device dml
     python compare_configs.py --early-stop --aug off --corrupt off   # baseline
     python compare_configs.py --early-stop --aug on  --corrupt off
+    python compare_configs.py --test --latent-dims 32 48 64 --warmups 0 --epochs 268 --n-gen 5000 --seeds 0 1 2
+    python compare_configs.py --test --latent-dims 32 --warmups 0 --epochs 268 --residual off --z-skip off
 
 Augmentation (AUGMENT) and denoising input corruption (CORRUPT) are those of
 code/mytrain.py, in both training paths (with and without warm-up); --aug and
@@ -91,6 +109,7 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -104,9 +123,11 @@ from torcheval.metrics.image.fid import FIDInceptionV3  # noqa: E402
 
 import mytrain                                          # noqa: E402
 from data import get_dataset                            # noqa: E402
-from mymodel import VAE                                 # noqa: E402
+import mymodel                                          # noqa: E402
+from mymodel import MODE_STAGE1, VAE                    # noqa: E402
 from myoptim import BATCH_SIZE, get_optimizer           # noqa: E402
-from mytrain import loss_function, make_batch, train_one_epoch  # noqa: E402
+from mytrain import (ema_discard, ema_weights, loss_function, start_stage2,  # noqa: E402
+                     train_one_epoch)
 from result import _to_rgb                              # noqa: E402
 
 FID_BATCH = 50      # images given to Inception-v3 at a time
@@ -150,14 +171,38 @@ def parse_args():
                         "code/mytrain.py)")
     p.add_argument("--corrupt", choices=["on", "off"], default=None,
                    help="denoising input corruption (default: CORRUPT of code/mytrain.py)")
+    p.add_argument("--residual", choices=["on", "off"], default=None,
+                   help="residual blocks in the encoder and decoder (default: RESIDUAL "
+                        "of code/mymodel.py)")
+    p.add_argument("--z-skip", choices=["on", "off"], default=None,
+                   help="z into every decoder layer, generative skip model (default: "
+                        "Z_SKIP of code/mymodel.py)")
+    p.add_argument("--ema", choices=["on", "off"], default=None,
+                   help="EMA of the weights (default: EMA of code/mytrain.py)")
+    p.add_argument("--whiten", choices=["off", "on", "both"], default="both",
+                   help="measure each model without (off), with (on) or both without "
+                        "and with (both) the whitening of its latents (default both)")
     args = p.parse_args()
+    # the whitening is applied here at each measurement, never during the
+    # training (train_one_epoch would switch the model at STAGE1_EPOCHS)
+    mytrain.STAGE2 = None
+    args.stage2_kinds = {"off": ["none"], "on": ["whiten"], "both": ["none", "whiten"]}[args.whiten]
     if args.aug is not None:
         mytrain.AUGMENT = args.aug == "on"
     if args.corrupt is not None:
         mytrain.CORRUPT = args.corrupt == "on"
+    if args.residual is not None:
+        mymodel.RESIDUAL = args.residual == "on"
+    if args.z_skip is not None:
+        mymodel.Z_SKIP = args.z_skip == "on"
+    if args.ema is not None:
+        mytrain.EMA = args.ema == "on"
     args.seeds = list(dict.fromkeys(args.seeds))    # without repeats, in order
     if args.epochs is None:
         args.epochs = 1000 if args.early_stop else 200
+    # EMA: its weights replace the weights after the last epoch (and are
+    # swapped in for every measure before)
+    mytrain.STAGE1_EPOCHS = args.epochs
     if args.eval_every is None:
         args.eval_every = 0 if args.early_stop else 50
     return args
@@ -226,8 +271,16 @@ class FID:
 
     @torch.no_grad()
     def _features(self, images):
-        feats = [self.model(_to_rgb(x.to(self.device))).cpu().float()
-                 for x in images.split(FID_BATCH)]
+        # FIDInceptionV3.forward enlarges the images to 299 x 299 (bilinear)
+        # and runs the network. The enlargement is done here on the CPU, because
+        # the bilinear interpolation of DirectML gives different values (on the
+        # same model: FID 43.4 instead of 39.3, even the wrong order between
+        # models); only the network runs on the device.
+        feats = []
+        for x in images.split(FID_BATCH):
+            x = F.interpolate(_to_rgb(x.cpu()), size=(299, 299), mode="bilinear",
+                              align_corners=False)
+            feats.append(self.model.model(x.to(self.device)).cpu().float())
         return torch.cat(feats)
 
     @staticmethod
@@ -281,26 +334,10 @@ def validation_loss(model, images, device):
 # ---------------------------------------------------------------- training
 
 def train_epoch_warmup(model, optimizer, loader, device, beta):
-    """train_one_epoch with the loss recon + beta * kl back-propagated, and the
-    same augmentation and input corruption (make_batch of code/mytrain.py).
-    Returns the averages of recon + kl, recon and kl, like train_one_epoch."""
-    model.train()
-    sums = {"loss": 0.0, "recon": 0.0, "kl": 0.0}
-    count = 0
-    for x in loader:
-        x_in, x = make_batch(x)
-        x_in, x = x_in.to(device), x.to(device)
-        x_hat, mu, logvar = model(x_in)
-        loss, recon, kl = loss_function(x, x_hat, mu, logvar)
-        optimizer.zero_grad()
-        (recon + beta * kl).backward()
-        optimizer.step()
-        n = x.size(0)
-        sums["loss"] += loss.item() * n
-        sums["recon"] += recon.item() * n
-        sums["kl"] += kl.item() * n
-        count += n
-    return {k: v / count for k, v in sums.items()}
+    """train_one_epoch with the loss recon + beta * kl back-propagated (same
+    augmentation, input corruption and EMA). Returns the
+    averages of recon + kl, recon and kl, like train_one_epoch."""
+    return train_one_epoch(model, optimizer, loader, device, kl_weight=beta)
 
 
 def beta_at(epoch, warmup):
@@ -329,12 +366,12 @@ def aggregate(rows):
     (early stop) together."""
     groups = {}
     for r in rows:
-        key = (r["latent_dim"], r["warmup"], r["kind"],
+        key = (r["latent_dim"], r["warmup"], r["kind"], r["stage2"],
                r["epoch"] if r["kind"] == "periodic" else None)
         groups.setdefault(key, []).append(r)
     aggs = []
-    for (latent_dim, warmup, kind, _), rs in groups.items():
-        a = {"latent_dim": latent_dim, "warmup": warmup, "kind": kind,
+    for (latent_dim, warmup, kind, stage2, _), rs in groups.items():
+        a = {"latent_dim": latent_dim, "warmup": warmup, "kind": kind, "stage2": stage2,
              "n_seeds": len(rs), "seeds": " ".join(str(r["seed"]) for r in rs)}
         for k in ("epoch", "recon_error", "fid"):
             a[k], a[k + "_std"] = mean_std(r[k] for r in rs)
@@ -360,10 +397,18 @@ def save_plot(aggs, val_curves, path):
     n_axes = 4 if val_curves else 3
     fig, axes = plt.subplots(1, n_axes, figsize=(5 * n_axes, 4.5), constrained_layout=True)
 
-    for (d, w) in configs:
-        style = dict(color=color[(d, w)], linestyle="-" if w == 0 else "--",
-                     label=f"latent {d}, warm-up {w}")
-        mine = [a for a in aggs if a["latent_dim"] == d and a["warmup"] == w]
+    stage2_kinds = sorted({a["stage2"] for a in aggs}, key=["none", "whiten"].index)
+    for (d, w), stage2 in [(c, s) for c in configs for s in stage2_kinds]:
+        # whitening: same color, dotted line and hollow markers
+        style = dict(color=color[(d, w)],
+                     linestyle=("-" if w == 0 else "--") if stage2 == "none"
+                     else (":" if w == 0 else "-."),
+                     label=f"latent {d}, warm-up {w}"
+                           + ("" if len(stage2_kinds) == 1 else f", {stage2}"))
+        if stage2 == "whiten":
+            style["markerfacecolor"] = "none"
+        mine = [a for a in aggs if a["latent_dim"] == d and a["warmup"] == w
+                and a["stage2"] == stage2]
         has_periodic = any(a["kind"] == "periodic" for a in mine)
         for kind, marker in (("periodic", "o"), ("best", "*")):
             sel = sorted((a for a in mine if a["kind"] == kind), key=lambda a: a["epoch"])
@@ -387,6 +432,10 @@ def save_plot(aggs, val_curves, path):
                              xytext=(3, 3), textcoords="offset points")
             axes[1].errorbar(ep, fid, xerr=err["epoch"], yerr=err["fid"], **s)
             axes[2].errorbar(ep, rec, xerr=err["epoch"], yerr=err["recon_error"], **s)
+
+    for (d, w) in configs:
+        style = dict(color=color[(d, w)], linestyle="-" if w == 0 else "--",
+                     label=f"latent {d}, warm-up {w}")
         # validation loss: one curve per seed
         for i, (curve, best_epoch) in enumerate(val_curves.get((d, w), [])):
             s = style if i == 0 else {k: v for k, v in style.items() if k != "label"}
@@ -459,7 +508,10 @@ def main():
     aug_text = "on" if mytrain.AUGMENT else "off"
     corrupt_text = "on" if mytrain.CORRUPT else "off"
     print(mode)
-    print(f"augmentation {aug_text} | input corruption {corrupt_text}")
+    print(f"augmentation {aug_text} | input corruption {corrupt_text} | "
+          f"EMA {'on' if mytrain.EMA else 'off'} | "
+          f"residual {'on' if mymodel.RESIDUAL else 'off'} | "
+          f"z skip {'on' if mymodel.Z_SKIP else 'off'}")
     print(f"device {device_name} | batch {BATCH_SIZE} | {n_configs} settings x "
           f"{len(args.seeds)} seeds {args.seeds} | "
           f"{'max ' if args.early_stop else ''}{args.epochs} epochs | "
@@ -481,24 +533,43 @@ def main():
     out_dir = ROOT / "compare"
     out_dir.mkdir(exist_ok=True)
     csv_path = out_dir / f"run_{stamp}.csv"
-    fields = ["latent_dim", "warmup", "aug", "corrupt", "seed", "kind", "epoch", "stop_epoch",
-              "val_loss", "train_loss", "train_recon", "train_kl", "recon_error", "fid"]
+    fields = ["latent_dim", "warmup", "aug", "corrupt", "seed", "kind", "stage2", "epoch",
+              "stop_epoch", "val_loss", "train_loss", "train_recon", "train_kl",
+              "recon_error", "fid"]
     rows, val_curves = [], {}
 
     def measure(writer, f, latent_dim, warmup, seed, kind, epoch, tr, model, recon_images,
-                stop_epoch="", val_loss=""):
-        rec = reconstruction_error(model, recon_images, device)
-        fd = fid(model, args.n_gen)
-        row = {"latent_dim": latent_dim, "warmup": warmup, "aug": aug_text,
-               "corrupt": corrupt_text, "seed": seed, "kind": kind,
-               "epoch": epoch, "stop_epoch": stop_epoch, "val_loss": val_loss,
-               "train_loss": tr["loss"], "train_recon": tr["recon"],
-               "train_kl": tr["kl"], "recon_error": rec, "fid": fd}
-        rows.append(row)
-        writer.writerow({k: (round(v, 4) if isinstance(v, float) else v)
-                         for k, v in row.items()})
-        f.flush()
-        return rec, fd
+                loader, stop_epoch="", val_loss=""):
+        """Measure the model (its EMA weights, if any) for each of
+        args.stage2_kinds; returns the text 'recon error ... | FID ...' for
+        the log."""
+        with ema_weights(model):
+            return _measure(writer, f, latent_dim, warmup, seed, kind, epoch, tr, model,
+                            recon_images, loader, stop_epoch, val_loss)
+
+    def _measure(writer, f, latent_dim, warmup, seed, kind, epoch, tr, model, recon_images,
+                 loader, stop_epoch, val_loss):
+        texts = []
+        for stage2 in args.stage2_kinds:
+            if stage2 == "whiten":
+                with torch.random.fork_rng(devices=[]):      # training unchanged
+                    start_stage2(model, loader, device, "whiten")
+            rec = reconstruction_error(model, recon_images, device)
+            fd = fid(model, args.n_gen)
+            model.stage2_mode.fill_(MODE_STAGE1)
+            model.train()
+            row = {"latent_dim": latent_dim, "warmup": warmup, "aug": aug_text,
+                   "corrupt": corrupt_text, "seed": seed, "kind": kind, "stage2": stage2,
+                   "epoch": epoch, "stop_epoch": stop_epoch, "val_loss": val_loss,
+                   "train_loss": tr["loss"], "train_recon": tr["recon"],
+                   "train_kl": tr["kl"], "recon_error": rec, "fid": fd}
+            rows.append(row)
+            writer.writerow({k: (round(v, 4) if isinstance(v, float) else v)
+                             for k, v in row.items()})
+            f.flush()
+            name = "" if len(args.stage2_kinds) == 1 else f" ({stage2})"
+            texts.append(f"recon error{name} {rec:6.2f} | FID{name} {fd:7.2f}")
+        return " | ".join(texts)
 
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
@@ -531,14 +602,15 @@ def main():
                                                             beta_at(epoch, warmup))
 
                                 if args.early_stop:
-                                    vl = validation_loss(model, val_images, device)
-                                    curve.append(vl)
-                                    if epoch > warmup:          # KL weight is 1 from here
-                                        if vl < best_loss - args.min_delta:
-                                            best_loss, best_epoch, wait = vl, epoch, 0
-                                            best_state, best_tr = cpu_state(model), tr
-                                        else:
-                                            wait += 1
+                                    with ema_weights(model):    # EMA weights, if any
+                                        vl = validation_loss(model, val_images, device)
+                                        curve.append(vl)
+                                        if epoch > warmup:      # KL weight is 1 from here
+                                            if vl < best_loss - args.min_delta:
+                                                best_loss, best_epoch, wait = vl, epoch, 0
+                                                best_state, best_tr = cpu_state(model), tr
+                                            else:
+                                                wait += 1
                                     if epoch % 50 == 0:
                                         print(f"  epoch {epoch:4d} | train loss "
                                               f"{tr['loss']:7.2f} | val loss {vl:7.2f} | "
@@ -547,13 +619,12 @@ def main():
                                               f"{time.time() - t_cfg:4.0f} s", flush=True)
 
                                 if epoch in eval_epochs:
-                                    rec, fd = measure(writer, f, latent_dim, warmup, seed,
-                                                      "periodic", epoch, tr, model,
-                                                      recon_images)
+                                    text = measure(writer, f, latent_dim, warmup, seed,
+                                                   "periodic", epoch, tr, model,
+                                                   recon_images, loader)
                                     print(f"  epoch {epoch:4d} | train loss {tr['loss']:7.2f} "
-                                          f"(kl {tr['kl']:5.2f}) | recon error {rec:6.2f} | "
-                                          f"FID {fd:7.2f} | {time.time() - t_cfg:5.0f} s",
-                                          flush=True)
+                                          f"(kl {tr['kl']:5.2f}) | {text} | "
+                                          f"{time.time() - t_cfg:5.0f} s", flush=True)
 
                                 if args.early_stop and wait >= args.patience:
                                     stop_epoch = epoch
@@ -575,15 +646,16 @@ def main():
                                 best_epoch, best_tr = epoch, tr
                             else:
                                 model.load_state_dict(best_state)
+                                ema_discard(model)      # best_state holds the EMA weights
                             val_curves.setdefault((latent_dim, warmup), []).append(
                                 (curve, best_epoch))
-                            rec, fd = measure(writer, f, latent_dim, warmup, seed, "best",
-                                              best_epoch, best_tr, model, recon_images,
-                                              stop_epoch=stop_epoch,
-                                              val_loss=best_loss if best_state else "")
+                            text = measure(writer, f, latent_dim, warmup, seed, "best",
+                                           best_epoch, best_tr, model, recon_images, loader,
+                                           stop_epoch=stop_epoch,
+                                           val_loss=best_loss if best_state else "")
                             print(f"  stopped at epoch {stop_epoch} | BEST epoch {best_epoch} "
-                                  f"| val loss {best_loss:7.2f} | recon error {rec:6.2f} | "
-                                  f"FID {fd:7.2f} | {time.time() - t_cfg:5.0f} s", flush=True)
+                                  f"| val loss {best_loss:7.2f} | {text} | "
+                                  f"{time.time() - t_cfg:5.0f} s", flush=True)
         except KeyboardInterrupt:
             print("\ninterrupted; reporting the measurements so far")
 
@@ -594,8 +666,8 @@ def main():
     aggs = aggregate(rows)
     multi = any(a["n_seeds"] > 1 for a in aggs)
     mean_path = out_dir / f"run_{stamp}_mean.csv"
-    mean_fields = ["latent_dim", "warmup", "kind", "n_seeds", "seeds", "epoch", "epoch_std",
-                   "recon_error", "recon_error_std", "fid", "fid_std"]
+    mean_fields = ["latent_dim", "warmup", "kind", "stage2", "n_seeds", "seeds", "epoch",
+                   "epoch_std", "recon_error", "recon_error_std", "fid", "fid_std"]
     with open(mean_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=mean_fields)
         writer.writeheader()
@@ -608,10 +680,11 @@ def main():
 
     w_val = 17 if multi else 9
     print(f"\n{'mean over the seeds, ' if multi else ''}sorted by FID:")
-    print(f"{'latent':>6} {'warm-up':>7} {'kind':>8} {'epoch':>{11 if multi else 5}} "
+    print(f"{'latent':>6} {'warm-up':>7} {'kind':>8} {'stage 2':>7} "
+          f"{'epoch':>{11 if multi else 5}} "
           f"{'seeds':>5} {'recon err':>{w_val}} {'FID':>{w_val}}")
     for a in sorted(aggs, key=lambda a: a["fid"]):
-        print(f"{a['latent_dim']:6d} {a['warmup']:7d} {a['kind']:>8} "
+        print(f"{a['latent_dim']:6d} {a['warmup']:7d} {a['kind']:>8} {a['stage2']:>7} "
               f"{epoch_text(a):>{11 if multi else 5}} {a['n_seeds']:5d} "
               f"{fmt(a, 'recon_error'):>{w_val}} {fmt(a, 'fid'):>{w_val}}")
     if len({a["n_seeds"] for a in aggs}) > 1:
@@ -625,15 +698,19 @@ def main():
     print(f"\nnot beaten on both {'mean ' if multi else ''}values by another measurement:")
     for a in sorted(pareto, key=lambda a: a["fid"]):
         print(f"  latent {a['latent_dim']}, warm-up {a['warmup']}, epoch {epoch_text(a)} "
-              f"({a['kind']}): recon error {fmt(a, 'recon_error')}, FID {fmt(a, 'fid')}")
+              f"({a['kind']}, stage 2 {a['stage2']}): recon error {fmt(a, 'recon_error')}, "
+              f"FID {fmt(a, 'fid')}")
 
-    best_aggs = [a for a in aggs if a["kind"] == "best"]
+    # one line per setting (the best epoch does not depend on the whitening)
+    best_aggs = [a for a in aggs if a["kind"] == "best"
+                 and a["stage2"] == args.stage2_kinds[0]]
     if best_aggs:
         print(f"\nNUM_EPOCHS for the notebook ({'mean best epoch over the seeds; ' if multi else ''}"
               f"trained there on all {len(full)} images; "
               f"the second value keeps the number of optimizer steps):")
         for a in best_aggs:
             epochs = [r["epoch"] for r in rows if r["kind"] == "best"
+                      and r["stage2"] == a["stage2"]
                       and r["latent_dim"] == a["latent_dim"] and r["warmup"] == a["warmup"]]
             print(f"  latent {a['latent_dim']}, warm-up {a['warmup']}: "
                   f"{round(a['epoch'])}  (or about {round(a['epoch'] * n_train / len(full))})"
