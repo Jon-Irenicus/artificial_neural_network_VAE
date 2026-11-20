@@ -25,6 +25,8 @@ import math
 import torch
 import torch.nn.functional as F
 
+from mymodel import MODE_STAGE1, MODE_VAE, MODE_WHITEN
+
 # ------------------------------------------------------------------ settings
 
 AUGMENT = True      # weak geometric / stroke augmentation of the training images
@@ -49,6 +51,20 @@ ELASTIC_SIGMA = 4.0     # smoothed random field (alpha) and its Gaussian width (
                         # alpha 10, sigma 4: about 0.6 pixel of displacement on average
 STROKE_MAX = 0.5        # blend weight toward a 3x3 dilation (thicker) or erosion (thinner)
 GAMMA_MAX = 1.3         # x ** gamma with gamma in [1/1.3, 1.3] (softer / sharper edges)
+
+# Two-stage VAE (see code/mymodel.py). train_one_epoch trains stage 1 for
+# STAGE1_EPOCHS epochs; at the end of the last of them it fits the whitening,
+# then (STAGE2 = "vae") trains the stage-2 VAE in the following epochs, with
+# stage 1 frozen. NUM_EPOCHS of code/myoptim.py adds the two.
+STAGE2 = None           # None (stage 1 only, no quotes), "whiten", or "vae" (whiten + stage-2 VAE)
+                        # "vae" collapses for now (gamma stays 1, KL 0): FID 120+, recon 80+
+STAGE1_EPOCHS = 268
+STAGE2_EPOCHS = 300     # epochs of the stage-2 VAE (used only with STAGE2 = "vae")
+STAGE2_AUGMENT = True   # stage-1 latents of augmented images (if AUGMENT) for stage 2
+STAGE2_INPUT = "sample" # latents for stage 2: "sample" z ~ q(z|x) or "mean" mu of q(z|x)
+STAGE2_STAT_PASSES = 20 # passes over the training images to fit the whitening
+STAGE2_REPEAT = 8       # each image is encoded this many times per stage-2 step
+STAGE2_LOG_GAMMA_MIN = -12.0  # lower bound of log gamma of the stage-2 decoder
 
 # Denoising: probability that an image is corrupted, then one of three
 # corruptions chosen uniformly
@@ -257,24 +273,94 @@ def train_one_epoch(model, optimizer, dataloader, device):
         average of each term per image over the whole epoch.
     """
     # TODO
+    if STAGE2 not in (None, "whiten", "vae"):
+        raise ValueError(f'mytrain.STAGE2 = {STAGE2!r}: use None (no quotes), "whiten" or "vae"')
     model.train()
+    model.epochs_trained = getattr(model, "epochs_trained", 0) + 1
     acc_loss = acc_recon = acc_kl = 0
 
     for x in dataloader:
-        # augmentation on the CPU batch: cheap at 32 x 32, and the same on every device
-        x_in, x = make_batch(x)
-        x_in, x = x_in.to(device), x.to(device)
-        x_hat, mu, logvar = model(x_in)
-        loss, recon, kl = loss_function(x, x_hat, mu, logvar)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        acc_loss += loss.item() * x.size(0)
-        acc_recon += recon.item() * x.size(0)
-        acc_kl += kl.item() * x.size(0)
+        b = x.size(0)
+        if int(model.stage2_mode) == MODE_VAE:
+            loss, recon, kl = _stage2_step(model, optimizer, x, device)
+        else:
+            # augmentation on the CPU batch: cheap at 32 x 32, and the same on every device
+            x_in, x = make_batch(x)
+            x_in, x = x_in.to(device), x.to(device)
+            mu, logvar = model.encode1(x_in)
+            x_hat = model.decode1(model.reparameterize(mu, logvar))
+            loss, recon, kl = loss_function(x, x_hat, mu, logvar)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        acc_loss += loss.item() * b
+        acc_recon += recon.item() * b
+        acc_kl += kl.item() * b
 
-    losses = {"loss": acc_loss / len(dataloader.dataset), "recon": acc_recon / len(dataloader.dataset), "kl": acc_kl / len(dataloader.dataset)}
+    # end of stage 1: switch to stage 2
+    if (STAGE2 and model.epochs_trained == STAGE1_EPOCHS
+            and int(model.stage2_mode) == MODE_STAGE1):
+        start_stage2(model, dataloader, device, STAGE2)
+
+    n = len(dataloader.dataset)
+    losses = {"loss": acc_loss / n, "recon": acc_recon / n, "kl": acc_kl / n}
     return losses
+
+
+# ------------------------------------------------------------------ stage 2
+
+def _stage2_images(x):
+    """Training images whose stage-1 latents are used by stage 2."""
+    return augment(x) if (AUGMENT and STAGE2_AUGMENT) else x
+
+
+def _stage1_latents(model, x):
+    """Stage-1 latents of a batch: z ~ q(z|x), or its mean (STAGE2_INPUT)."""
+    mu, logvar = model.encode1(x)
+    return model.reparameterize(mu, logvar) if STAGE2_INPUT == "sample" else mu
+
+
+@torch.no_grad()
+def start_stage2(model, dataloader, device, kind="vae"):
+    """Fit the whitening to the stage-1 latents of the training images
+    (STAGE2_STAT_PASSES passes, with fresh augmentation and z samples each
+    time) and switch the model to stage 2: kind "whiten" or "vae"."""
+    if kind not in ("whiten", "vae"):
+        raise ValueError(f'start_stage2: kind = {kind!r}, expected "whiten" or "vae"')
+    model.eval()
+    z = torch.cat([_stage1_latents(model, _stage2_images(x).to(device)).cpu()
+                   for _ in range(STAGE2_STAT_PASSES) for x in dataloader]).double()
+    mean = z.mean(0)
+    cov = torch.cov(z.T)
+    model.set_whitening(mean, cov, MODE_VAE if kind == "vae" else MODE_WHITEN)
+    model.train()
+
+
+def stage2_loss(w, w_hat, mu, logvar, log_gamma):
+    """Negative ELBO of the stage-2 VAE, averaged over the batch, with the
+    Gaussian decoder N(w_hat, gamma I), gamma = exp(log_gamma) learned
+    (the constant d/2 log(2 pi) is left out)."""
+    d = w.size(1)
+    recon = (((w - w_hat) ** 2).sum(1) / (2 * log_gamma.exp())
+             + 0.5 * d * log_gamma).mean()
+    kl = -0.5 * torch.sum(1 + logvar - mu ** 2 - logvar.exp(), dim=1).mean()
+    return recon + kl, recon, kl
+
+
+def _stage2_step(model, optimizer, x, device):
+    """One update of the stage-2 VAE on a batch of training images, encoded
+    STAGE2_REPEAT times by the frozen stage 1."""
+    x = x.repeat(STAGE2_REPEAT, 1, 1, 1)
+    with torch.no_grad():
+        w = model.whiten(_stage1_latents(model, _stage2_images(x).to(device)))
+    mu, logvar = model.s2.encode(w)
+    w_hat = model.s2.decode(model.reparameterize(mu, logvar))
+    log_gamma = model.s2.log_gamma.clamp(min=STAGE2_LOG_GAMMA_MIN)
+    loss, recon, kl = stage2_loss(w, w_hat, mu, logvar, log_gamma)
+    optimizer.zero_grad(set_to_none=True)   # stage-1 parameters keep grad None:
+    loss.backward()                         # AdamW skips them (no weight decay)
+    optimizer.step()
+    return loss, recon, kl
 
 
 # ------------------------------------------------------------------ preview
