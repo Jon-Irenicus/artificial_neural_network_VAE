@@ -20,7 +20,7 @@ import torch.nn as nn
 
 
 class VAE(nn.Module):
-    def __init__(self):
+    def __init__(self, latent_dim=32):
         """Define the layers of the encoder and of the decoder.
 
         The notebook creates the model with `VAE()`, so every argument you
@@ -30,7 +30,83 @@ class VAE(nn.Module):
         """
         super().__init__()
         # TODO: set self.latent_dim and define the layers
-        raise NotImplementedError("mymodel.py: VAE.__init__ is not implemented")
+        self.latent_dim = latent_dim
+
+        self.enc = nn.Sequential(
+            nn.Conv2d(
+                in_channels=1,
+                out_channels=8,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                bias=False
+            ), nn.GroupNorm(num_groups=2, num_channels=8), nn.ReLU(),
+            nn.Conv2d(
+                in_channels=8,
+                out_channels=16,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                bias=False
+            ), nn.GroupNorm(num_groups=4, num_channels=16), nn.ReLU(),
+            nn.Conv2d(
+                in_channels=16,
+                out_channels=32,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                bias=False
+            ), nn.GroupNorm(num_groups=8, num_channels=32), nn.ReLU(),
+            nn.Conv2d(
+                in_channels=32,
+                out_channels=64,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                bias=False
+            ), nn.GroupNorm(num_groups=16, num_channels=64), nn.ReLU(),
+            nn.Flatten()
+        )
+
+        self.fc_mu = nn.Linear(64*4*4, latent_dim)
+        self.fc_logvar = nn.Linear(64*4*4, latent_dim)
+
+        self.dec = nn.Sequential(
+            nn.Linear(latent_dim, 64*4*4), nn.ReLU(),
+            nn.Unflatten(1, (64, 4, 4)),
+            nn.ConvTranspose2d(
+                in_channels=64,
+                out_channels=32,
+                kernel_size=4,
+                stride=2,
+                padding=1,
+                bias=False
+            ), nn.GroupNorm(num_groups=8, num_channels=32), nn.ReLU(),
+            nn.ConvTranspose2d(
+                in_channels=32,
+                out_channels=16,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                bias=False
+            ), nn.GroupNorm(num_groups=4, num_channels=16), nn.ReLU(),
+            nn.ConvTranspose2d(
+                in_channels=16,
+                out_channels=8,
+                kernel_size=4,
+                stride=2,
+                padding=1,
+                bias=False
+            ), nn.GroupNorm(num_groups=2, num_channels=8), nn.ReLU(),
+            nn.ConvTranspose2d(
+                in_channels=8,
+                out_channels=1,
+                kernel_size=4,
+                stride=2,
+                padding=1
+            )
+        )
+
 
     def encode(self, x):
         """Encoder: parameters of q(z|x) = N(z; mu, diag(exp(logvar))).
@@ -41,8 +117,9 @@ class VAE(nn.Module):
         Returns:
             (mu, logvar), each of shape (B, latent_dim).
         """
-        # TODO
-        raise NotImplementedError("mymodel.py: VAE.encode is not implemented")
+        h = self.enc(x)
+        return self.fc_mu(h), self.fc_logvar(h)
+        
 
     def reparameterize(self, mu, logvar):
         """Draw z ~ N(mu, diag(exp(logvar))) with the reparameterization
@@ -55,7 +132,8 @@ class VAE(nn.Module):
             z, shape (B, latent_dim).
         """
         # TODO
-        raise NotImplementedError("mymodel.py: VAE.reparameterize is not implemented")
+        z = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar)
+        return z
 
     def decode(self, z):
         """Decoder: pixel-wise mean of p(x|z).
@@ -67,7 +145,7 @@ class VAE(nn.Module):
             x_hat, shape (B, 1, 32, 32), values in [0, 1].
         """
         # TODO
-        raise NotImplementedError("mymodel.py: VAE.decode is not implemented")
+        return torch.sigmoid(self.dec(z))
 
     def forward(self, x):
         """Encode x, draw z from q(z|x), and decode z.
@@ -79,4 +157,7 @@ class VAE(nn.Module):
             (x_hat, mu, logvar).
         """
         # TODO
-        raise NotImplementedError("mymodel.py: VAE.forward is not implemented")
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        x_hat = self.decode(z)
+        return x_hat, mu, logvar
