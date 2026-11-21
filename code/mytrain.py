@@ -57,8 +57,8 @@ GAMMA_MAX = 1.3         # x ** gamma with gamma in [1/1.3, 1.3] (softer / sharpe
 # then (STAGE2 = "vae") trains the stage-2 VAE in the following epochs, with
 # stage 1 frozen. NUM_EPOCHS of code/myoptim.py adds the two.
 STAGE2 = "vae"           # None (stage 1 only, no quotes), "whiten", or "vae" (whiten + stage-2 VAE)
-STAGE1_EPOCHS = 239
-STAGE2_EPOCHS = 300     # epochs of the stage-2 VAE (used only with STAGE2 = "vae")
+STAGE1_EPOCHS = 188
+STAGE2_EPOCHS = 130     # epochs of the stage-2 VAE (used only with STAGE2 = "vae")
 STAGE2_AUGMENT = True   # stage-1 latents of augmented images (if AUGMENT) for stage 2
 STAGE2_INPUT = "mean"   # latents for stage 2: "sample" z ~ q(z|x) or "mean" mu of q(z|x)
                         # "sample" collapses: the posterior noise (std ~0.6) makes the
