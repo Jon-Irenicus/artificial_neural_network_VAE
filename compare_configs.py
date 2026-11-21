@@ -54,14 +54,14 @@ DirectML gives different values), and the statistics of the features and the
 Frechet distance are computed on the CPU (DirectML has no eigenvalue routine)
 with the float32 formulas of torcheval.
 
-Whitening (--whiten, default both): the second stage of code/mymodel.py, which
-decodes z = m + L u with u ~ N(0, I), m and L L^T the mean and covariance of
-the latents of the training images (mytrain.start_stage2). At every
+Whitening (--whiten, default both): the whitening of code/mymodel.py, which
+decodes z = m + L w with w ~ N(0, I), m and L L^T the mean and covariance of
+the latents of the training images (mytrain.fit_whitening). At every
 measurement the model is measured as trained ("none") and with the whitening
 fitted to its training images ("whiten"), then switched back, so that its
 training goes on unchanged (the random numbers of the fit are not taken from
 those of the training). The reconstruction error is the same for both: the
-whitening is exactly invertible. Whatever STAGE2 of code/mytrain.py says, the
+whitening is exactly invertible. Whatever WHITEN of code/mytrain.py says, the
 model is never switched during the training.
 
 Seeds (--seeds, default 0): every setting is trained once per seed, and the
@@ -124,9 +124,9 @@ from torcheval.metrics.image.fid import FIDInceptionV3  # noqa: E402
 import mytrain                                          # noqa: E402
 from data import get_dataset                            # noqa: E402
 import mymodel                                          # noqa: E402
-from mymodel import MODE_STAGE1, VAE                    # noqa: E402
+from mymodel import VAE                                 # noqa: E402
 from myoptim import BATCH_SIZE, get_optimizer           # noqa: E402
-from mytrain import (ema_discard, ema_weights, loss_function, start_stage2,  # noqa: E402
+from mytrain import (ema_discard, ema_weights, fit_whitening, loss_function,  # noqa: E402
                      train_one_epoch)
 from result import _to_rgb                              # noqa: E402
 
@@ -184,9 +184,9 @@ def parse_args():
                         "and with (both) the whitening of its latents (default both)")
     args = p.parse_args()
     # the whitening is applied here at each measurement, never during the
-    # training (train_one_epoch would switch the model at STAGE1_EPOCHS)
-    mytrain.STAGE2 = None
-    args.stage2_kinds = {"off": ["none"], "on": ["whiten"], "both": ["none", "whiten"]}[args.whiten]
+    # training (train_one_epoch would switch the model after mytrain.EPOCHS)
+    mytrain.WHITEN = False
+    args.whiten_kinds = {"off": ["none"], "on": ["whiten"], "both": ["none", "whiten"]}[args.whiten]
     if args.aug is not None:
         mytrain.AUGMENT = args.aug == "on"
     if args.corrupt is not None:
@@ -202,7 +202,7 @@ def parse_args():
         args.epochs = 1000 if args.early_stop else 200
     # EMA: its weights replace the weights after the last epoch (and are
     # swapped in for every measure before)
-    mytrain.STAGE1_EPOCHS = args.epochs
+    mytrain.EPOCHS = args.epochs
     if args.eval_every is None:
         args.eval_every = 0 if args.early_stop else 50
     return args
@@ -366,12 +366,12 @@ def aggregate(rows):
     (early stop) together."""
     groups = {}
     for r in rows:
-        key = (r["latent_dim"], r["warmup"], r["kind"], r["stage2"],
+        key = (r["latent_dim"], r["warmup"], r["kind"], r["whitening"],
                r["epoch"] if r["kind"] == "periodic" else None)
         groups.setdefault(key, []).append(r)
     aggs = []
-    for (latent_dim, warmup, kind, stage2, _), rs in groups.items():
-        a = {"latent_dim": latent_dim, "warmup": warmup, "kind": kind, "stage2": stage2,
+    for (latent_dim, warmup, kind, whitening, _), rs in groups.items():
+        a = {"latent_dim": latent_dim, "warmup": warmup, "kind": kind, "whitening": whitening,
              "n_seeds": len(rs), "seeds": " ".join(str(r["seed"]) for r in rs)}
         for k in ("epoch", "recon_error", "fid"):
             a[k], a[k + "_std"] = mean_std(r[k] for r in rs)
@@ -397,18 +397,18 @@ def save_plot(aggs, val_curves, path):
     n_axes = 4 if val_curves else 3
     fig, axes = plt.subplots(1, n_axes, figsize=(5 * n_axes, 4.5), constrained_layout=True)
 
-    stage2_kinds = sorted({a["stage2"] for a in aggs}, key=["none", "whiten"].index)
-    for (d, w), stage2 in [(c, s) for c in configs for s in stage2_kinds]:
+    whiten_kinds = sorted({a["whitening"] for a in aggs}, key=["none", "whiten"].index)
+    for (d, w), whitening in [(c, s) for c in configs for s in whiten_kinds]:
         # whitening: same color, dotted line and hollow markers
         style = dict(color=color[(d, w)],
-                     linestyle=("-" if w == 0 else "--") if stage2 == "none"
+                     linestyle=("-" if w == 0 else "--") if whitening == "none"
                      else (":" if w == 0 else "-."),
                      label=f"latent {d}, warm-up {w}"
-                           + ("" if len(stage2_kinds) == 1 else f", {stage2}"))
-        if stage2 == "whiten":
+                           + ("" if len(whiten_kinds) == 1 else f", {whitening}"))
+        if whitening == "whiten":
             style["markerfacecolor"] = "none"
         mine = [a for a in aggs if a["latent_dim"] == d and a["warmup"] == w
-                and a["stage2"] == stage2]
+                and a["whitening"] == whitening]
         has_periodic = any(a["kind"] == "periodic" for a in mine)
         for kind, marker in (("periodic", "o"), ("best", "*")):
             sel = sorted((a for a in mine if a["kind"] == kind), key=lambda a: a["epoch"])
@@ -533,7 +533,7 @@ def main():
     out_dir = ROOT / "compare"
     out_dir.mkdir(exist_ok=True)
     csv_path = out_dir / f"run_{stamp}.csv"
-    fields = ["latent_dim", "warmup", "aug", "corrupt", "seed", "kind", "stage2", "epoch",
+    fields = ["latent_dim", "warmup", "aug", "corrupt", "seed", "kind", "whitening", "epoch",
               "stop_epoch", "val_loss", "train_loss", "train_recon", "train_kl",
               "recon_error", "fid"]
     rows, val_curves = [], {}
@@ -541,7 +541,7 @@ def main():
     def measure(writer, f, latent_dim, warmup, seed, kind, epoch, tr, model, recon_images,
                 loader, stop_epoch="", val_loss=""):
         """Measure the model (its EMA weights, if any) for each of
-        args.stage2_kinds; returns the text 'recon error ... | FID ...' for
+        args.whiten_kinds; returns the text 'recon error ... | FID ...' for
         the log."""
         with ema_weights(model):
             return _measure(writer, f, latent_dim, warmup, seed, kind, epoch, tr, model,
@@ -550,16 +550,16 @@ def main():
     def _measure(writer, f, latent_dim, warmup, seed, kind, epoch, tr, model, recon_images,
                  loader, stop_epoch, val_loss):
         texts = []
-        for stage2 in args.stage2_kinds:
-            if stage2 == "whiten":
+        for whitening in args.whiten_kinds:
+            if whitening == "whiten":
                 with torch.random.fork_rng(devices=[]):      # training unchanged
-                    start_stage2(model, loader, device, "whiten")
+                    fit_whitening(model, loader, device)
             rec = reconstruction_error(model, recon_images, device)
             fd = fid(model, args.n_gen)
-            model.stage2_mode.fill_(MODE_STAGE1)
+            model.whitened.fill_(False)
             model.train()
             row = {"latent_dim": latent_dim, "warmup": warmup, "aug": aug_text,
-                   "corrupt": corrupt_text, "seed": seed, "kind": kind, "stage2": stage2,
+                   "corrupt": corrupt_text, "seed": seed, "kind": kind, "whitening": whitening,
                    "epoch": epoch, "stop_epoch": stop_epoch, "val_loss": val_loss,
                    "train_loss": tr["loss"], "train_recon": tr["recon"],
                    "train_kl": tr["kl"], "recon_error": rec, "fid": fd}
@@ -567,7 +567,7 @@ def main():
             writer.writerow({k: (round(v, 4) if isinstance(v, float) else v)
                              for k, v in row.items()})
             f.flush()
-            name = "" if len(args.stage2_kinds) == 1 else f" ({stage2})"
+            name = "" if len(args.whiten_kinds) == 1 else f" ({whitening})"
             texts.append(f"recon error{name} {rec:6.2f} | FID{name} {fd:7.2f}")
         return " | ".join(texts)
 
@@ -666,7 +666,7 @@ def main():
     aggs = aggregate(rows)
     multi = any(a["n_seeds"] > 1 for a in aggs)
     mean_path = out_dir / f"run_{stamp}_mean.csv"
-    mean_fields = ["latent_dim", "warmup", "kind", "stage2", "n_seeds", "seeds", "epoch",
+    mean_fields = ["latent_dim", "warmup", "kind", "whitening", "n_seeds", "seeds", "epoch",
                    "epoch_std", "recon_error", "recon_error_std", "fid", "fid_std"]
     with open(mean_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=mean_fields)
@@ -680,11 +680,11 @@ def main():
 
     w_val = 17 if multi else 9
     print(f"\n{'mean over the seeds, ' if multi else ''}sorted by FID:")
-    print(f"{'latent':>6} {'warm-up':>7} {'kind':>8} {'stage 2':>7} "
+    print(f"{'latent':>6} {'warm-up':>7} {'kind':>8} {'whiten':>9} "
           f"{'epoch':>{11 if multi else 5}} "
           f"{'seeds':>5} {'recon err':>{w_val}} {'FID':>{w_val}}")
     for a in sorted(aggs, key=lambda a: a["fid"]):
-        print(f"{a['latent_dim']:6d} {a['warmup']:7d} {a['kind']:>8} {a['stage2']:>7} "
+        print(f"{a['latent_dim']:6d} {a['warmup']:7d} {a['kind']:>8} {a['whitening']:>9} "
               f"{epoch_text(a):>{11 if multi else 5}} {a['n_seeds']:5d} "
               f"{fmt(a, 'recon_error'):>{w_val}} {fmt(a, 'fid'):>{w_val}}")
     if len({a["n_seeds"] for a in aggs}) > 1:
@@ -698,19 +698,19 @@ def main():
     print(f"\nnot beaten on both {'mean ' if multi else ''}values by another measurement:")
     for a in sorted(pareto, key=lambda a: a["fid"]):
         print(f"  latent {a['latent_dim']}, warm-up {a['warmup']}, epoch {epoch_text(a)} "
-              f"({a['kind']}, stage 2 {a['stage2']}): recon error {fmt(a, 'recon_error')}, "
+              f"({a['kind']}, whitening {a['whitening']}): recon error {fmt(a, 'recon_error')}, "
               f"FID {fmt(a, 'fid')}")
 
     # one line per setting (the best epoch does not depend on the whitening)
     best_aggs = [a for a in aggs if a["kind"] == "best"
-                 and a["stage2"] == args.stage2_kinds[0]]
+                 and a["whitening"] == args.whiten_kinds[0]]
     if best_aggs:
         print(f"\nNUM_EPOCHS for the notebook ({'mean best epoch over the seeds; ' if multi else ''}"
               f"trained there on all {len(full)} images; "
               f"the second value keeps the number of optimizer steps):")
         for a in best_aggs:
             epochs = [r["epoch"] for r in rows if r["kind"] == "best"
-                      and r["stage2"] == a["stage2"]
+                      and r["whitening"] == a["whitening"]
                       and r["latent_dim"] == a["latent_dim"] and r["warmup"] == a["warmup"]]
             print(f"  latent {a['latent_dim']}, warm-up {a['warmup']}: "
                   f"{round(a['epoch'])}  (or about {round(a['epoch'] * n_train / len(full))})"

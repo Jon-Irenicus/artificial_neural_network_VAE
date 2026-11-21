@@ -14,25 +14,19 @@ Notation
     logvar : log-variance of q(z|x),   shape (B, latent_dim)
     x_hat  : decoded images,           shape (B, 1, 32, 32), values in [0, 1]
 
-Two-stage VAE (Dai & Wipf, "Diagnosing and Enhancing VAE Models", ICLR 2019)
-    stage 1   the convolutional VAE x <-> z below (encode1 / decode1)
-    stage 2   models the distribution of z, so that decoding z ~ N(0, I) lands
-              where the stage-1 decoder has seen data:
-                mode 1  whitening: z = m + L u, with m and L L^T the mean and
-                        covariance of the stage-1 latents (exactly invertible,
-                        so the reconstruction is unchanged)
-                mode 2  whitening, then a small MLP VAE w <-> u on the
-                        whitened latents w, with a Gaussian decoder of learned
-                        variance gamma (Stage2 below)
-    The mode is a buffer (saved in the state_dict); 0 means stage 1 only.
-    encode / decode go through the active stages, so the notebook and
-    util/result.py see one VAE whose latent variable is u:
-        encode(x) = stage-2 encoder( whiten( mu1(x) ) )
-        decode(u) = decode1( unwhiten( stage-2 decoder(u) ) )
-    The stages are trained one after the other by mytrain.train_one_epoch.
+Whitening of the latents
+    The convolutional VAE x <-> z below (encode1 / decode1) is trained as
+    usual. After the training, mytrain fits the mean m and the covariance
+    L L^T of the latents of the training images, and the model switches to
+    the whitened latent variable w:
+        encode(x) = L^{-1} ( mu1(x) - m )
+        decode(w) = decode1( m + L w )
+    so that decoding w ~ N(0, I) lands where the decoder has seen data. The
+    transform is exactly invertible, so the reconstruction is unchanged.
+    The switch is a buffer (`whitened`, saved in the state_dict).
 
-Skip connections of stage 1 (module constants, so that other scripts can
-switch them, e.g. `mymodel.Z_SKIP = False` before creating the model)
+Skip connections (module constants, so that other scripts can switch them,
+e.g. `mymodel.Z_SKIP = False` before creating the model)
     RESIDUAL  every resolution step of the encoder and of the decoder is a
               residual block, conv-GN-ReLU-conv-GN plus a shortcut (identity,
               or a 1x1 conv / 2x2 transposed conv when the shape changes),
@@ -46,13 +40,11 @@ switch them, e.g. `mymodel.Z_SKIP = False` before creating the model)
               as it gets deeper, which keeps the latent variables in use.
     There is no connection from the encoder to the decoder (as in a U-Net):
     it would bypass z, and images could not be generated from z alone.
-    With both off, stage 1 is the plain convolutional VAE.
+    With both off, the model is the plain convolutional VAE.
 """
 
 import torch
 import torch.nn as nn
-
-MODE_STAGE1, MODE_WHITEN, MODE_VAE = 0, 1, 2
 
 RESIDUAL = True     # residual blocks inside the encoder and inside the decoder
 Z_SKIP = True       # z enters every decoder layer (generative skip model)
@@ -114,38 +106,8 @@ class Block(nn.Module):
         return self.act(h + self.shortcut(x))
 
 
-class Stage2(nn.Module):
-    """VAE of the whitened stage-1 latents w <-> u, both of dimension d.
-    MLP encoder and decoder; the decoder is a Gaussian N(w_hat, gamma I) with a
-    learned variance gamma = exp(log_gamma)."""
-
-    def __init__(self, d, hidden=512):
-        super().__init__()
-        self.enc = nn.Sequential(
-            nn.Linear(d, hidden), nn.SiLU(),
-            nn.Linear(hidden, hidden), nn.SiLU(),
-            nn.Linear(hidden, hidden), nn.SiLU(),
-        )
-        self.fc_mu = nn.Linear(hidden, d)
-        self.fc_logvar = nn.Linear(hidden, d)
-        self.dec = nn.Sequential(
-            nn.Linear(d, hidden), nn.SiLU(),
-            nn.Linear(hidden, hidden), nn.SiLU(),
-            nn.Linear(hidden, hidden), nn.SiLU(),
-            nn.Linear(hidden, d),
-        )
-        self.log_gamma = nn.Parameter(torch.zeros(()))
-
-    def encode(self, w):
-        h = self.enc(w)
-        return self.fc_mu(h), self.fc_logvar(h)
-
-    def decode(self, u):
-        return self.dec(u)
-
-
 class VAE(nn.Module):
-    def __init__(self, latent_dim=32, stage2_hidden=512, channels=(32, 64, 128, 256),
+    def __init__(self, latent_dim=32, channels=(32, 64, 128, 256),
                  residual=None, z_skip=None):
         """Define the layers of the encoder and of the decoder.
 
@@ -192,17 +154,16 @@ class VAE(nn.Module):
         self.dec_out = nn.ConvTranspose2d(c1, 1, kernel_size=4, stride=2, padding=1)
         self.dec_out_z = nn.Linear(latent_dim, 1) if self.z_skip else None
 
-        # ---- stage 2
-        self.s2 = Stage2(latent_dim, stage2_hidden)
-        self.register_buffer("stage2_mode", torch.tensor(MODE_STAGE1))
+        # ---- whitening of the latents (identity until set_whitening)
+        self.register_buffer("whitened", torch.tensor(False))
         self.register_buffer("z_mean", torch.zeros(latent_dim))
         self.register_buffer("z_chol", torch.eye(latent_dim))      # lower triangular L
         self.register_buffer("z_chol_inv", torch.eye(latent_dim))  # L^{-1}
 
-    # ------------------------------------------------------------ stage 1
+    # ------------------------------------------------------------ VAE without whitening
 
     def encode1(self, x):
-        """Stage-1 encoder: (mu, logvar) of q(z|x)."""
+        """Encoder without whitening: (mu, logvar) of q(z|x)."""
         h = x
         for block in self.enc:
             h = block(h)
@@ -210,7 +171,7 @@ class VAE(nn.Module):
         return self.fc_mu(h), self.fc_logvar(h)
 
     def decode1(self, z):
-        """Stage-1 decoder: pixel-wise mean of p(x|z), in [0, 1]."""
+        """Decoder without whitening: pixel-wise mean of p(x|z), in [0, 1]."""
         h = self.dec_fc(z)
         for block in self.dec:
             h = block(h, z)
@@ -221,9 +182,9 @@ class VAE(nn.Module):
 
     # ------------------------------------------------------------ whitening
 
-    def set_whitening(self, mean, cov, mode):
+    def set_whitening(self, mean, cov):
         """Store the mean and the Cholesky factor of the covariance of the
-        stage-1 latents, and switch to `mode` (MODE_WHITEN or MODE_VAE).
+        latents, and switch the model to the whitened latent variable.
         The factorization runs on the CPU in float64 (some devices, such as
         DirectML, have no linear-algebra routines); the forward pass then only
         needs matrix products."""
@@ -234,7 +195,7 @@ class VAE(nn.Module):
         self.z_mean.copy_(mean.detach().cpu().float())
         self.z_chol.copy_(chol.float())
         self.z_chol_inv.copy_(chol_inv.float())
-        self.stage2_mode.fill_(mode)
+        self.whitened.fill_(True)
 
     def whiten(self, z):
         """w = L^{-1} (z - m), row by row."""
@@ -249,8 +210,8 @@ class VAE(nn.Module):
     def encode(self, x):
         """Encoder: parameters of q(z|x) = N(z; mu, diag(exp(logvar))).
 
-        With stage 2 active, the latent variable is u (see the module
-        docstring), and (mu, logvar) are those of q(u|x).
+        When whitened, the latent variable is w (see the module docstring),
+        and (mu, logvar) are those of q(w|x).
 
         Args:
             x: images, shape (B, 1, 32, 32).
@@ -259,17 +220,12 @@ class VAE(nn.Module):
             (mu, logvar), each of shape (B, latent_dim).
         """
         mu, logvar = self.encode1(x)
-        mode = int(self.stage2_mode)
-        if mode == MODE_STAGE1:
+        if not self.whitened:
             return mu, logvar
-        w = self.whiten(mu)
-        if mode == MODE_VAE:
-            return self.s2.encode(w)
-        # whitening only: the posterior covariance becomes L^-1 diag(var) L^-T,
-        # whose diagonal is returned (only its mean w is used for evaluation)
+        # the posterior covariance becomes L^-1 diag(var) L^-T, whose diagonal
+        # is returned (only its mean w is used for evaluation)
         var_w = logvar.exp() @ (self.z_chol_inv ** 2).T
-        return w, var_w.log()
-
+        return self.whiten(mu), var_w.log()
 
     def reparameterize(self, mu, logvar):
         """Draw z ~ N(mu, diag(exp(logvar))) with the reparameterization
@@ -294,10 +250,7 @@ class VAE(nn.Module):
         Returns:
             x_hat, shape (B, 1, 32, 32), values in [0, 1].
         """
-        mode = int(self.stage2_mode)
-        if mode == MODE_VAE:
-            z = self.s2.decode(z)
-        if mode != MODE_STAGE1:
+        if self.whitened:
             z = self.unwhiten(z)
         return self.decode1(z)
 
