@@ -107,7 +107,7 @@ class Block(nn.Module):
 
 
 class VAE(nn.Module):
-    def __init__(self, latent_dim=32, channels=(32, 64, 128, 256),
+    def __init__(self, latent_dim=64, channels=(32, 64, 128, 256),
                  residual=None, z_skip=None):
         """Define the layers of the encoder and of the decoder.
 

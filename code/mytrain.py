@@ -53,7 +53,7 @@ GAMMA_MAX = 1.3         # x ** gamma with gamma in [1/1.3, 1.3] (softer / sharpe
 # Number of training epochs (NUM_EPOCHS of code/myoptim.py). At the end of the
 # last one, train_one_epoch puts the EMA weights into the model and (WHITEN)
 # fits the whitening of the latents (see code/mymodel.py).
-EPOCHS = 268
+EPOCHS = 209
 WHITEN = True           # fit the whitening at the end of the training
 WHITEN_AUGMENT = True   # latents of augmented images (if AUGMENT) for the whitening
 WHITEN_INPUT = "sample" # latents for the whitening: "sample" z ~ q(z|x) or "mean" mu of q(z|x)
