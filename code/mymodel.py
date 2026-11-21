@@ -47,6 +47,10 @@ switch them, e.g. `mymodel.Z_SKIP = False` before creating the model)
     There is no connection from the encoder to the decoder (as in a U-Net):
     it would bypass z, and images could not be generated from z alone.
     With both off, stage 1 is the plain convolutional VAE.
+
+ENC_DROPOUT: dropout on the flattened encoder features, just before fc_mu and
+fc_logvar (0: none). Active only in training mode: model.eval() (the
+evaluation, the whitening statistics, the stage-2 inputs) turns it off.
 """
 
 import torch
@@ -56,6 +60,11 @@ MODE_STAGE1, MODE_WHITEN, MODE_VAE = 0, 1, 2
 
 RESIDUAL = True     # residual blocks inside the encoder and inside the decoder
 Z_SKIP = True       # z enters every decoder layer (generative skip model)
+ENC_DROPOUT = 0   # dropout just before the encoder FC layers (0: none)
+# initial log gamma of the stage-2 decoder. Not 0: gamma = 1 with w_hat = 0 is
+# the N(0, I) fit of the whitened latents, a fixed point where stage 2 ignores u
+# (posterior collapse) and every generated image decodes the same z.
+STAGE2_LOG_GAMMA_INIT = -3.0
 
 
 def _norm(c):
@@ -134,7 +143,7 @@ class Stage2(nn.Module):
             nn.Linear(hidden, hidden), nn.SiLU(),
             nn.Linear(hidden, d),
         )
-        self.log_gamma = nn.Parameter(torch.zeros(()))
+        self.log_gamma = nn.Parameter(torch.tensor(STAGE2_LOG_GAMMA_INIT))
 
     def encode(self, w):
         h = self.enc(w)
@@ -145,8 +154,8 @@ class Stage2(nn.Module):
 
 
 class VAE(nn.Module):
-    def __init__(self, latent_dim=32, stage2_hidden=512, channels=(32, 64, 128, 256),
-                 residual=None, z_skip=None):
+    def __init__(self, latent_dim=64, stage2_hidden=512, channels=(32, 64, 128, 256),
+                 residual=None, z_skip=None, enc_dropout=None):
         """Define the layers of the encoder and of the decoder.
 
         The notebook creates the model with `VAE()`, so every argument you
@@ -160,6 +169,10 @@ class VAE(nn.Module):
 
         residual, z_skip: the skip connections of the module docstring
         (None: the module constants RESIDUAL and Z_SKIP).
+
+        enc_dropout: dropout probability before fc_mu / fc_logvar (None: the
+        module constant ENC_DROPOUT). It has no parameters, so a saved model
+        loads whatever its value.
         """
         super().__init__()
         # TODO: set self.latent_dim and define the layers
@@ -177,6 +190,8 @@ class VAE(nn.Module):
             Block(c2, c3, "down", res),
             Block(c3, c4, None, res),
         ])
+        self.enc_dropout = ENC_DROPOUT if enc_dropout is None else enc_dropout
+        self.enc_drop = nn.Dropout(self.enc_dropout)
         self.fc_mu = nn.Linear(c4*4*4, latent_dim)
         self.fc_logvar = nn.Linear(c4*4*4, latent_dim)
 
@@ -206,7 +221,7 @@ class VAE(nn.Module):
         h = x
         for block in self.enc:
             h = block(h)
-        h = h.flatten(1)
+        h = self.enc_drop(h.flatten(1))
         return self.fc_mu(h), self.fc_logvar(h)
 
     def decode1(self, z):

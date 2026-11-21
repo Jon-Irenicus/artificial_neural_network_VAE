@@ -81,12 +81,15 @@ Examples:
     python compare_configs.py --early-stop --device dml
     python compare_configs.py --early-stop --aug off --corrupt off   # baseline
     python compare_configs.py --early-stop --aug on  --corrupt off
+    python compare_configs.py --early-stop --aug both --corrupt both     # 4 combinations
     python compare_configs.py --test --latent-dims 32 48 64 --warmups 0 --epochs 268 --n-gen 5000 --seeds 0 1 2
     python compare_configs.py --test --latent-dims 32 --warmups 0 --epochs 268 --residual off --z-skip off
 
 Augmentation (AUGMENT) and denoising input corruption (CORRUPT) are those of
 code/mytrain.py, in both training paths (with and without warm-up); --aug and
---corrupt override them for the run. Compare runs with the same --seeds: they
+--corrupt override them for the run, and with "both" each setting is trained
+twice, without and with (like --latent-dims and --warmups, they multiply the
+number of settings). Compare runs with the same --seeds: they
 use the same held-out images. The validation loss and the measures always use
 clean, unaugmented images.
 
@@ -166,17 +169,21 @@ def parse_args():
     p.add_argument("--device", default="auto",
                    choices=["auto", "cuda", "rocm", "dml", "mps", "cpu"],
                    help="device to compute on (default auto)")
-    p.add_argument("--aug", choices=["on", "off"], default=None,
-                   help="augmentation of the training images (default: AUGMENT of "
-                        "code/mytrain.py)")
-    p.add_argument("--corrupt", choices=["on", "off"], default=None,
-                   help="denoising input corruption (default: CORRUPT of code/mytrain.py)")
+    p.add_argument("--aug", choices=["on", "off", "both"], default=None,
+                   help="augmentation of the training images; both: a model trained "
+                        "without and one with (default: AUGMENT of code/mytrain.py)")
+    p.add_argument("--corrupt", choices=["on", "off", "both"], default=None,
+                   help="denoising input corruption; both: a model trained without and "
+                        "one with (default: CORRUPT of code/mytrain.py)")
     p.add_argument("--residual", choices=["on", "off"], default=None,
                    help="residual blocks in the encoder and decoder (default: RESIDUAL "
                         "of code/mymodel.py)")
     p.add_argument("--z-skip", choices=["on", "off"], default=None,
                    help="z into every decoder layer, generative skip model (default: "
                         "Z_SKIP of code/mymodel.py)")
+    p.add_argument("--enc-dropout", type=float, default=None, metavar="P",
+                   help="dropout just before the encoder FC layers, 0 for none "
+                        "(default: ENC_DROPOUT of code/mymodel.py)")
     p.add_argument("--ema", choices=["on", "off"], default=None,
                    help="EMA of the weights (default: EMA of code/mytrain.py)")
     p.add_argument("--whiten", choices=["off", "on", "both"], default="both",
@@ -187,14 +194,19 @@ def parse_args():
     # training (train_one_epoch would switch the model at STAGE1_EPOCHS)
     mytrain.STAGE2 = None
     args.stage2_kinds = {"off": ["none"], "on": ["whiten"], "both": ["none", "whiten"]}[args.whiten]
-    if args.aug is not None:
-        mytrain.AUGMENT = args.aug == "on"
-    if args.corrupt is not None:
-        mytrain.CORRUPT = args.corrupt == "on"
+    # values of AUGMENT and CORRUPT to train with (set per setting in main)
+    def values(option, default):
+        return {"on": [True], "off": [False], "both": [False, True], None: [default]}[option]
+    args.aug_values = values(args.aug, mytrain.AUGMENT)
+    args.corrupt_values = values(args.corrupt, mytrain.CORRUPT)
     if args.residual is not None:
         mymodel.RESIDUAL = args.residual == "on"
     if args.z_skip is not None:
         mymodel.Z_SKIP = args.z_skip == "on"
+    if args.enc_dropout is not None:
+        if not 0 <= args.enc_dropout < 1:
+            p.error("--enc-dropout must be in [0, 1)")
+        mymodel.ENC_DROPOUT = args.enc_dropout
     if args.ema is not None:
         mytrain.EMA = args.ema == "on"
     args.seeds = list(dict.fromkeys(args.seeds))    # without repeats, in order
@@ -360,18 +372,36 @@ def mean_std(values):
     return statistics.mean(values), (statistics.stdev(values) if len(values) > 1 else 0.0)
 
 
+def onoff(flag):
+    return "on" if flag else "off"
+
+
+def setting_of(r):
+    """The setting a model was trained with: (latent_dim, warmup, aug, corrupt)."""
+    return (r["latent_dim"], r["warmup"], r["aug"], r["corrupt"])
+
+
+def setting_label(s, aggs):
+    """'latent 32, warm-up 0', plus aug / corrupt when they vary in the run."""
+    d, w, aug, corrupt = s
+    return (f"latent {d}, warm-up {w}"
+            + (f", aug {aug}" if len({a['aug'] for a in aggs}) > 1 else "")
+            + (f", corrupt {corrupt}" if len({a['corrupt'] for a in aggs}) > 1 else ""))
+
+
 def aggregate(rows):
     """Mean and standard deviation over the seeds of the measurements of one
     setting: the periodic ones of the same epoch together, and the best epochs
     (early stop) together."""
     groups = {}
     for r in rows:
-        key = (r["latent_dim"], r["warmup"], r["kind"], r["stage2"],
-               r["epoch"] if r["kind"] == "periodic" else None)
+        key = setting_of(r) + (r["kind"], r["stage2"],
+                               r["epoch"] if r["kind"] == "periodic" else None)
         groups.setdefault(key, []).append(r)
     aggs = []
-    for (latent_dim, warmup, kind, stage2, _), rs in groups.items():
-        a = {"latent_dim": latent_dim, "warmup": warmup, "kind": kind, "stage2": stage2,
+    for (latent_dim, warmup, aug, corrupt, kind, stage2, _), rs in groups.items():
+        a = {"latent_dim": latent_dim, "warmup": warmup, "aug": aug, "corrupt": corrupt,
+             "kind": kind, "stage2": stage2,
              "n_seeds": len(rs), "seeds": " ".join(str(r["seed"]) for r in rs)}
         for k in ("epoch", "recon_error", "fid"):
             a[k], a[k + "_std"] = mean_std(r[k] for r in rs)
@@ -391,24 +421,25 @@ def save_plot(aggs, val_curves, path):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    configs = sorted({(a["latent_dim"], a["warmup"]) for a in aggs} | set(val_curves))
+    # one color per setting (latent_dim, warmup, aug, corrupt)
+    configs = sorted({setting_of(a) for a in aggs} | set(val_curves))
     color = {c: plt.get_cmap("tab10")(i % 10) for i, c in enumerate(configs)}
     multi = any(a["n_seeds"] > 1 for a in aggs)
     n_axes = 4 if val_curves else 3
     fig, axes = plt.subplots(1, n_axes, figsize=(5 * n_axes, 4.5), constrained_layout=True)
 
     stage2_kinds = sorted({a["stage2"] for a in aggs}, key=["none", "whiten"].index)
-    for (d, w), stage2 in [(c, s) for c in configs for s in stage2_kinds]:
+    for c, stage2 in [(c, s) for c in configs for s in stage2_kinds]:
+        w = c[1]
         # whitening: same color, dotted line and hollow markers
-        style = dict(color=color[(d, w)],
+        style = dict(color=color[c],
                      linestyle=("-" if w == 0 else "--") if stage2 == "none"
                      else (":" if w == 0 else "-."),
-                     label=f"latent {d}, warm-up {w}"
+                     label=setting_label(c, aggs)
                            + ("" if len(stage2_kinds) == 1 else f", {stage2}"))
         if stage2 == "whiten":
             style["markerfacecolor"] = "none"
-        mine = [a for a in aggs if a["latent_dim"] == d and a["warmup"] == w
-                and a["stage2"] == stage2]
+        mine = [a for a in aggs if setting_of(a) == c and a["stage2"] == stage2]
         has_periodic = any(a["kind"] == "periodic" for a in mine)
         for kind, marker in (("periodic", "o"), ("best", "*")):
             sel = sorted((a for a in mine if a["kind"] == kind), key=lambda a: a["epoch"])
@@ -433,17 +464,17 @@ def save_plot(aggs, val_curves, path):
             axes[1].errorbar(ep, fid, xerr=err["epoch"], yerr=err["fid"], **s)
             axes[2].errorbar(ep, rec, xerr=err["epoch"], yerr=err["recon_error"], **s)
 
-    for (d, w) in configs:
-        style = dict(color=color[(d, w)], linestyle="-" if w == 0 else "--",
-                     label=f"latent {d}, warm-up {w}")
+    for c in configs:
+        style = dict(color=color[c], linestyle="-" if c[1] == 0 else "--",
+                     label=setting_label(c, aggs))
         # validation loss: one curve per seed
-        for i, (curve, best_epoch) in enumerate(val_curves.get((d, w), [])):
+        for i, (curve, best_epoch) in enumerate(val_curves.get(c, [])):
             s = style if i == 0 else {k: v for k, v in style.items() if k != "label"}
             axes[3].plot(range(1, len(curve) + 1), curve, linewidth=1.0,
                          alpha=0.6 if multi else 1.0, **s)
             if best_epoch:
                 axes[3].plot(best_epoch, curve[best_epoch - 1], marker="*",
-                             markersize=12, color=color[(d, w)])
+                             markersize=12, color=color[c])
 
     over = " (mean ± std over the seeds)" if multi else ""
     axes[0].set(xlabel="reconstruction error", ylabel="FID",
@@ -504,14 +535,15 @@ def main():
     else:
         eval_epochs = set() if args.early_stop else {args.epochs}
 
-    n_configs = len(args.latent_dims) * len(args.warmups)
-    aug_text = "on" if mytrain.AUGMENT else "off"
-    corrupt_text = "on" if mytrain.CORRUPT else "off"
+    n_configs = (len(args.latent_dims) * len(args.warmups)
+                 * len(args.aug_values) * len(args.corrupt_values))
     print(mode)
-    print(f"augmentation {aug_text} | input corruption {corrupt_text} | "
+    print(f"augmentation {' / '.join(map(onoff, args.aug_values))} | "
+          f"input corruption {' / '.join(map(onoff, args.corrupt_values))} | "
           f"EMA {'on' if mytrain.EMA else 'off'} | "
           f"residual {'on' if mymodel.RESIDUAL else 'off'} | "
-          f"z skip {'on' if mymodel.Z_SKIP else 'off'}")
+          f"z skip {'on' if mymodel.Z_SKIP else 'off'} | "
+          f"encoder dropout {mymodel.ENC_DROPOUT:g}")
     print(f"device {device_name} | batch {BATCH_SIZE} | {n_configs} settings x "
           f"{len(args.seeds)} seeds {args.seeds} | "
           f"{'max ' if args.early_stop else ''}{args.epochs} epochs | "
@@ -558,8 +590,9 @@ def main():
             fd = fid(model, args.n_gen)
             model.stage2_mode.fill_(MODE_STAGE1)
             model.train()
-            row = {"latent_dim": latent_dim, "warmup": warmup, "aug": aug_text,
-                   "corrupt": corrupt_text, "seed": seed, "kind": kind, "stage2": stage2,
+            row = {"latent_dim": latent_dim, "warmup": warmup, "aug": onoff(mytrain.AUGMENT),
+                   "corrupt": onoff(mytrain.CORRUPT), "seed": seed, "kind": kind,
+                   "stage2": stage2,
                    "epoch": epoch, "stop_epoch": stop_epoch, "val_loss": val_loss,
                    "train_loss": tr["loss"], "train_recon": tr["recon"],
                    "train_kl": tr["kl"], "recon_error": rec, "fid": fd}
@@ -579,9 +612,15 @@ def main():
                 train_set, val_images = split(seed)
                 recon_images = test_images if args.test else val_images
                 for latent_dim in args.latent_dims:
-                    for warmup in args.warmups:
+                    for warmup, aug, corrupt in [(w, a, c) for w in args.warmups
+                                                 for a in args.aug_values
+                                                 for c in args.corrupt_values]:
+                        # used by train_one_epoch (make_batch) and start_stage2
+                        mytrain.AUGMENT, mytrain.CORRUPT = aug, corrupt
+                        setting = (latent_dim, warmup, onoff(aug), onoff(corrupt))
                         print(f"\n=== seed {seed}: latent_dim {latent_dim}, "
-                              f"KL warm-up {warmup} epochs")
+                              f"KL warm-up {warmup} epochs, augmentation {onoff(aug)}, "
+                              f"input corruption {onoff(corrupt)}")
                         torch.manual_seed(seed)
                         loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
                         model = VAE(latent_dim=latent_dim).to(device)
@@ -647,7 +686,7 @@ def main():
                             else:
                                 model.load_state_dict(best_state)
                                 ema_discard(model)      # best_state holds the EMA weights
-                            val_curves.setdefault((latent_dim, warmup), []).append(
+                            val_curves.setdefault(setting, []).append(
                                 (curve, best_epoch))
                             text = measure(writer, f, latent_dim, warmup, seed, "best",
                                            best_epoch, best_tr, model, recon_images, loader,
@@ -666,8 +705,9 @@ def main():
     aggs = aggregate(rows)
     multi = any(a["n_seeds"] > 1 for a in aggs)
     mean_path = out_dir / f"run_{stamp}_mean.csv"
-    mean_fields = ["latent_dim", "warmup", "kind", "stage2", "n_seeds", "seeds", "epoch",
-                   "epoch_std", "recon_error", "recon_error_std", "fid", "fid_std"]
+    mean_fields = ["latent_dim", "warmup", "aug", "corrupt", "kind", "stage2", "n_seeds",
+                   "seeds", "epoch", "epoch_std", "recon_error", "recon_error_std",
+                   "fid", "fid_std"]
     with open(mean_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=mean_fields)
         writer.writeheader()
@@ -680,11 +720,12 @@ def main():
 
     w_val = 17 if multi else 9
     print(f"\n{'mean over the seeds, ' if multi else ''}sorted by FID:")
-    print(f"{'latent':>6} {'warm-up':>7} {'kind':>8} {'stage 2':>7} "
+    print(f"{'latent':>6} {'warm-up':>7} {'aug':>3} {'corrupt':>7} {'kind':>8} {'stage 2':>7} "
           f"{'epoch':>{11 if multi else 5}} "
           f"{'seeds':>5} {'recon err':>{w_val}} {'FID':>{w_val}}")
     for a in sorted(aggs, key=lambda a: a["fid"]):
-        print(f"{a['latent_dim']:6d} {a['warmup']:7d} {a['kind']:>8} {a['stage2']:>7} "
+        print(f"{a['latent_dim']:6d} {a['warmup']:7d} {a['aug']:>3} {a['corrupt']:>7} "
+              f"{a['kind']:>8} {a['stage2']:>7} "
               f"{epoch_text(a):>{11 if multi else 5}} {a['n_seeds']:5d} "
               f"{fmt(a, 'recon_error'):>{w_val}} {fmt(a, 'fid'):>{w_val}}")
     if len({a["n_seeds"] for a in aggs}) > 1:
@@ -697,7 +738,7 @@ def main():
                          for o in aggs)]
     print(f"\nnot beaten on both {'mean ' if multi else ''}values by another measurement:")
     for a in sorted(pareto, key=lambda a: a["fid"]):
-        print(f"  latent {a['latent_dim']}, warm-up {a['warmup']}, epoch {epoch_text(a)} "
+        print(f"  {setting_label(setting_of(a), aggs)}, epoch {epoch_text(a)} "
               f"({a['kind']}, stage 2 {a['stage2']}): recon error {fmt(a, 'recon_error')}, "
               f"FID {fmt(a, 'fid')}")
 
@@ -710,9 +751,8 @@ def main():
               f"the second value keeps the number of optimizer steps):")
         for a in best_aggs:
             epochs = [r["epoch"] for r in rows if r["kind"] == "best"
-                      and r["stage2"] == a["stage2"]
-                      and r["latent_dim"] == a["latent_dim"] and r["warmup"] == a["warmup"]]
-            print(f"  latent {a['latent_dim']}, warm-up {a['warmup']}: "
+                      and r["stage2"] == a["stage2"] and setting_of(r) == setting_of(a)]
+            print(f"  {setting_label(setting_of(a), aggs)}: "
                   f"{round(a['epoch'])}  (or about {round(a['epoch'] * n_train / len(full))})"
                   + (f"  best epochs per seed {epochs}" if len(epochs) > 1 else ""))
 

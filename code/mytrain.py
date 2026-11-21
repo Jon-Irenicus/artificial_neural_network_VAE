@@ -56,12 +56,14 @@ GAMMA_MAX = 1.3         # x ** gamma with gamma in [1/1.3, 1.3] (softer / sharpe
 # STAGE1_EPOCHS epochs; at the end of the last of them it fits the whitening,
 # then (STAGE2 = "vae") trains the stage-2 VAE in the following epochs, with
 # stage 1 frozen. NUM_EPOCHS of code/myoptim.py adds the two.
-STAGE2 = "whiten"           # None (stage 1 only, no quotes), "whiten", or "vae" (whiten + stage-2 VAE)
-                        # "vae" collapses for now (gamma stays 1, KL 0): FID 120+, recon 80+
-STAGE1_EPOCHS = 268
+STAGE2 = "vae"           # None (stage 1 only, no quotes), "whiten", or "vae" (whiten + stage-2 VAE)
+STAGE1_EPOCHS = 239
 STAGE2_EPOCHS = 300     # epochs of the stage-2 VAE (used only with STAGE2 = "vae")
 STAGE2_AUGMENT = True   # stage-1 latents of augmented images (if AUGMENT) for stage 2
-STAGE2_INPUT = "sample" # latents for stage 2: "sample" z ~ q(z|x) or "mean" mu of q(z|x)
+STAGE2_INPUT = "mean"   # latents for stage 2: "sample" z ~ q(z|x) or "mean" mu of q(z|x)
+                        # "sample" collapses: the posterior noise (std ~0.6) makes the
+                        # whitened latents almost N(0, I), so stage 2 has nothing to learn.
+                        # "mean" also matches mymodel.encode, which whitens mu.
 STAGE2_STAT_PASSES = 20 # passes over the training images to fit the whitening
 STAGE2_REPEAT = 8       # each image is encoded this many times per stage-2 step
 STAGE2_LOG_GAMMA_MIN = -12.0  # lower bound of log gamma of the stage-2 decoder
@@ -440,8 +442,10 @@ def _stage2_step(model, optimizer, x, device):
     """One update of the stage-2 VAE on a batch of training images, encoded
     STAGE2_REPEAT times by the frozen stage 1."""
     x = x.repeat(STAGE2_REPEAT, 1, 1, 1)
+    model.eval()            # frozen stage 1 without dropout, as at evaluation
     with torch.no_grad():
         w = model.whiten(_stage1_latents(model, _stage2_images(x).to(device)))
+    model.train()
     mu, logvar = model.s2.encode(w)
     w_hat = model.s2.decode(model.reparameterize(mu, logvar))
     log_gamma = model.s2.log_gamma.clamp(min=STAGE2_LOG_GAMMA_MIN)

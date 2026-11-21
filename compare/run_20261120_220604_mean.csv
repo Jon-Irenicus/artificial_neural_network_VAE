@@ -1,0 +1,4 @@
+latent_dim,warmup,aug,corrupt,kind,stage2,n_seeds,seeds,epoch,epoch_std,recon_error,recon_error_std,fid,fid_std
+32,0,on,off,best,whiten,5,0 1 2 3 4,222.4,31.588,6.1223,0.0758,31.981,0.9593
+48,0,on,off,best,whiten,5,0 1 2 3 4,221.6,29.3053,6.1761,0.1107,31.6158,1.5321
+64,0,on,off,best,whiten,5,0 1 2 3 4,239,36.5582,6.1581,0.1286,31.0317,2.0551
